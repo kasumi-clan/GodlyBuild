@@ -1,266 +1,101 @@
-name: Godly APK Builder Engine
+name: Build Godly Island APK (debug)
 
 on:
+  push:
   workflow_dispatch:
-    inputs:
-      build_id:
-        description: "Unique Build ID"
-        required: true
-        type: string
-      user_id:
-        description: "Isolated User ID"
-        required: true
-        type: string
-      zip_path:
-        description: "Repository-relative path to uploaded session ZIP (ZIP 1)"
-        required: true
-        type: string
-      apk_basename:
-        description: "Output APK base filename derived from uploaded ZIP basename"
-        required: true
-        type: string
-      java_version:
-        description: "Preferred JDK version (default 17, or auto-detected)"
-        required: false
-        default: "17"
-        type: string
-
-permissions:
-  contents: read
-  actions: read
-
-concurrency:
-  group: godly-apk-build-${{ inputs.user_id }}-${{ inputs.build_id }}
-  cancel-in-progress: true
 
 jobs:
-  build-android-apk:
-    name: Compile Android Debug APK (${{ inputs.build_id }})
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      BUILD_ID: ${{ inputs.build_id }}
-      USER_ID: ${{ inputs.user_id }}
-      ZIP_PATH: ${{ inputs.zip_path }}
-      APK_BASENAME: ${{ inputs.apk_basename }}
-      PREFERRED_JAVA: ${{ inputs.java_version }}
-
     steps:
-      - name: Step 1 - Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Step 2 - Giải nén dự án an toàn (Validate & Extract Session ZIP 1)
-        id: extract
-        shell: bash
+      - name: Unzip project & Detect APK Name
+        id: loc
         run: |
-          set -euo pipefail
-          if [[ -z "${ZIP_PATH}" ]] || [[ ! -f "${ZIP_PATH}" ]]; then
-            echo "::error::ERROR_CODE=INVALID_ZIP|Session ZIP file not found at path: ${ZIP_PATH}"
-            exit 1
+          if [ -f settings.gradle.kts ] || [ -f settings.gradle ]; then
+            DIR="."
+            APK_NAME="GodlyIsland-debug.apk"
+          else
+            COUNT="$(ls -1 ./*.zip 2>/dev/null | wc -l)"
+            if [ "$COUNT" -eq 0 ]; then
+              echo "::error::Khong thay file .zip o thu muc goc repo"
+              exit 1
+            fi
+            if [ "$COUNT" -gt 1 ]; then
+              echo "::error::Co $COUNT file .zip o thu muc goc. Chi de lai 1 file duy nhat."
+              ls -1 ./*.zip
+              exit 1
+            fi
+            ZIP="$(ls -1 ./*.zip)"
+            ZIP_BASENAME="$(basename "$ZIP" .zip)"
+            echo "Giai nen: $ZIP"
+            mkdir -p _src
+            unzip -q -o "$ZIP" -d _src
+            
+            # Tim file settings.gradle hoac settings.gradle.kts ben trong source giai nen
+            FOUND="$(find _src -name settings.gradle.kts -o -name settings.gradle | head -n 1)"
+            if [ -z "$FOUND" ]; then
+              echo "::error::Trong $ZIP khong co settings.gradle hoac settings.gradle.kts"
+              exit 1
+            fi
+            DIR="$(dirname "$FOUND")"
+            APK_NAME="${ZIP_BASENAME}.apk"
           fi
-          if [[ "${ZIP_PATH}" == *"SampleZeroApp.zip"* ]] || [[ "${ZIP_PATH}" == *"zip0"* ]]; then
-            echo "::error::ERROR_CODE=INVALID_ZIP|Static example ZIP 0 cannot be used for production builds."
-            exit 1
-          fi
+          
+          echo "Thu muc du an: $DIR"
+          echo "Ten APK dau ra: $APK_NAME"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
 
-          WORKSPACE_DIR="${RUNNER_TEMP}/godly_workspace_${USER_ID}_${BUILD_ID}"
-          EXTRACT_DIR="${WORKSPACE_DIR}/extracted"
-          rm -rf "${EXTRACT_DIR}"
-          mkdir -p "${EXTRACT_DIR}"
-
-          ORIG_SHA256=$(sha256sum "${ZIP_PATH}" | awk '{print $1}')
-
-          python3 - << 'PYEOF'
-          import os, sys, shutil, zipfile, stat
-
-          zip_path = os.environ["ZIP_PATH"]
-          extract_dir = os.path.join(os.environ["RUNNER_TEMP"], f"godly_workspace_{os.environ['USER_ID']}_{os.environ['BUILD_ID']}", "extracted")
-          max_unpacked_bytes = 250 * 1024 * 1024  # Giới hạn 250MB chống Zip Bomb
-          max_files = 10000
-
-          if not zipfile.is_zipfile(zip_path):
-              print("::error::ERROR_CODE=INVALID_ZIP|Uploaded file is not a valid ZIP archive.")
-              sys.exit(1)
-
-          total_unpacked = 0
-          with zipfile.ZipFile(zip_path, "r") as zf:
-              if zf.testzip() is not None:
-                  print("::error::ERROR_CODE=INVALID_ZIP|Corrupted entry inside ZIP archive.")
-                  sys.exit(1)
-
-              infos = zf.infolist()
-              if len(infos) == 0 or len(infos) > max_files:
-                  print("::error::ERROR_CODE=INVALID_ZIP|Invalid file count inside ZIP archive.")
-                  sys.exit(1)
-
-              real_extract_root = os.path.realpath(extract_dir)
-              for info in infos:
-                  fname = info.filename.replace("\\", "/")
-                  # Chặn Zip Slip / Path Traversal
-                  if fname.startswith("/") or ".." in fname.split("/") or ":" in fname:
-                      print(f"::error::ERROR_CODE=INVALID_ZIP|Zip Slip detected: {fname}")
-                      sys.exit(1)
-                  # Chặn Symlink độc hại
-                  mode = (info.external_attr >> 16) & 0xFFFF
-                  if stat.S_ISLNK(mode):
-                      print(f"::error::ERROR_CODE=INVALID_ZIP|Symlinks inside ZIP are forbidden: {fname}")
-                      sys.exit(1)
-                  # Bỏ qua mọi workflow nằm bên trong ZIP để tránh inject CI/CD
-                  if ".github/workflows" in fname.lower():
-                      continue
-
-                  total_unpacked += info.file_size
-                  if total_unpacked > max_unpacked_bytes:
-                      print("::error::ERROR_CODE=INVALID_ZIP|Zip bomb / Unpacked size limit exceeded.")
-                      sys.exit(1)
-
-                  target_path = os.path.realpath(os.path.join(real_extract_root, fname))
-                  if not (target_path == real_extract_root or target_path.startswith(real_extract_root + os.sep)):
-                      print(f"::error::ERROR_CODE=INVALID_ZIP|Zip Slip target outside workspace: {fname}")
-                      sys.exit(1)
-
-                  if info.is_dir():
-                      os.makedirs(target_path, exist_ok=True)
-                  else:
-                      os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                      with zf.open(info, "r") as src, open(target_path, "wb") as dst:
-                          shutil.copyfileobj(src, dst)
-          PYEOF
-
-          AFTER_SHA256=$(sha256sum "${ZIP_PATH}" | awk '{print $1}')
-          if [[ "${ORIG_SHA256}" != "${AFTER_SHA256}" ]]; then
-            echo "::error::Original ZIP integrity changed unexpectedly!"
-            exit 1
-          fi
-          echo "extract_dir=${EXTRACT_DIR}" >> "${GITHUB_OUTPUT}"
-
-      - name: Step 3 - Configure Gradle (Auto-Detect Android Root, Module & JDK)
-        id: detect
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - << 'PYEOF'
-          import os, sys
-
-          extract_dir = "${{ steps.extract.outputs.extract_dir }}"
-          candidates = []
-          for root, dirs, files in os.walk(extract_dir):
-              dirs[:] = [d for d in dirs if d not in (".git", ".gradle", "build", "__MACOSX")]
-              if "settings.gradle.kts" in files or "settings.gradle" in files:
-                  depth = root[len(extract_dir):].count(os.sep)
-                  candidates.append((depth, root))
-
-          if not candidates:
-              print("::error::ERROR_CODE=MISSING_SETTINGS_GRADLE|Missing settings.gradle or settings.gradle.kts.")
-              sys.exit(1)
-
-          candidates.sort(key=lambda x: x[0])
-          android_root = candidates[0][1]
-
-          app_modules = []
-          detected_java = os.environ.get("PREFERRED_JAVA", "17")
-          for root, dirs, files in os.walk(android_root):
-              for bf in ("build.gradle.kts", "build.gradle"):
-                  if bf in files:
-                      content = open(os.path.join(root, bf), "r", encoding="utf-8", errors="ignore").read()
-                      if "com.android.application" in content or "libs.plugins.android.application" in content:
-                          rel = os.path.relpath(root, android_root)
-                          mod_name = "app" if rel == "." else rel.replace(os.sep, ":")
-                          if mod_name not in app_modules:
-                              app_modules.append(mod_name)
-                      if "VERSION_21" in content or 'jvmTarget = "21"' in content:
-                          detected_java = "21"
-
-          if not app_modules:
-              print("::error::ERROR_CODE=MISSING_APP_MODULE|No Android application module found.")
-              sys.exit(1)
-
-          selected_module = "app" if "app" in app_modules else app_modules[0]
-          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
-              out.write(f"android_root={android_root}\n")
-              out.write(f"app_module={selected_module}\n")
-              out.write(f"java_version={detected_java}\n")
-          PYEOF
-
-      - name: Setup JDK ${{ steps.detect.outputs.java_version }}
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: "temurin"
-          java-version: ${{ steps.detect.outputs.java_version }}
+          distribution: temurin
+          java-version: 17
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
+      - name: Build debug APK
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: gradle :app:assembleDebug --stacktrace --no-daemon
 
-      - name: Step 4 - Compile Android (Assemble Debug APK)
-        working-directory: ${{ steps.detect.outputs.android_root }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          APP_MODULE="${{ steps.detect.outputs.app_module }}"
-          TASK=":${APP_MODULE}:assembleDebug"
-          if [[ "${APP_MODULE}" == "." ]]; then
-            TASK="assembleDebug"
-          fi
-          if [[ -f "./gradlew" ]]; then
-            chmod +x ./gradlew
-            ./gradlew "${TASK}" --no-daemon --stacktrace 2>&1 | tee build_compile.log
-          else
-            gradle "${TASK}" --no-daemon --stacktrace 2>&1 | tee build_compile.log
-          fi
-
-      - name: Step 5 - Đóng gói APK (Verify Real APK & Rename to ZIP Basename)
+      - name: Rename and Prepare APK Output
         id: package
-        shell: bash
         run: |
-          set -euo pipefail
-          OUT_DIR="${RUNNER_TEMP}/godly_artifact_${USER_ID}_${BUILD_ID}"
-          mkdir -p "${OUT_DIR}"
-          python3 - << 'PYEOF'
-          import os, sys, shutil, zipfile
+          SRC_APK="$(find ${{ steps.loc.outputs.dir }} -name "*.apk" | grep -E "debug|unaligned" | head -n 1)"
+          if [ -z "$SRC_APK" ]; then
+            # Tim kiem tong quat neu khong thay theo filter
+            SRC_APK="$(find ${{ steps.loc.outputs.dir }} -name "*.apk" | head -n 1)"
+          fi
+          
+          if [ -z "$SRC_APK" ]; then
+            echo "::error::Khong tim thay file APK nao sau khi build!"
+            exit 1
+          fi
+          
+          mkdir -p build_output
+          DEST_APK="build_output/${{ steps.loc.outputs.apk_name }}"
+          cp "$SRC_APK" "$DEST_APK"
+          echo "Da dong goi APK tai: $DEST_APK"
+          echo "path=$DEST_APK" >> "$GITHUB_OUTPUT"
 
-          android_root = "${{ steps.detect.outputs.android_root }}"
-          apk_basename = os.environ["APK_BASENAME"]
-          out_dir = f"{os.environ['RUNNER_TEMP']}/godly_artifact_{os.environ['USER_ID']}_{os.environ['BUILD_ID']}"
-
-          safe_base = os.path.basename(apk_basename.strip())
-          for ext in (".zip", ".apk"):
-              if safe_base.lower().endswith(ext):
-                  safe_base = safe_base[:-4]
-          final_apk_name = f"{safe_base or 'app-debug'}.apk"
-
-          found_apks = []
-          for root, dirs, files in os.walk(android_root):
-              for f in files:
-                  if f.lower().endswith(".apk") and "unaligned" not in f.lower():
-                      full_p = os.path.join(root, f)
-                      size = os.path.getsize(full_p)
-                      if size > 1024 and zipfile.is_zipfile(full_p):
-                          with zipfile.ZipFile(full_p, "r") as zf:
-                              if "AndroidManifest.xml" in zf.namelist():
-                                  found_apks.append((size, full_p))
-
-          if not found_apks:
-              print("::error::ERROR_CODE=ARTIFACT_MISSING|No valid compiled Android APK found.")
-              sys.exit(1)
-
-          found_apks.sort(key=lambda x: x[0], reverse=True)
-          dest_apk = os.path.join(out_dir, final_apk_name)
-          shutil.copy2(found_apks[0][1], dest_apk)
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
-              out.write(f"apk_path={dest_apk}\n")
-          PYEOF
-
-      - name: Step 6 - Hoàn tất (Upload Verified APK Artifact)
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ inputs.user_id }}-${{ inputs.build_id }}
-          path: ${{ steps.package.outputs.apk_path }}
+          name: GodlyIsland-debug-apk
+          path: ${{ steps.package.outputs.path }}
           if-no-files-found: error
-          retention-days: 7
+
+      - name: Upload build reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GodlyIsland-build-reports
+          path: ${{ steps.loc.outputs.dir }}/app/build/reports
+          if-no-files-found: ignore
           
